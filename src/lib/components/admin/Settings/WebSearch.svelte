@@ -18,10 +18,12 @@
 		'brave',
 		'kagi',
 		'mojeek',
+		'bocha',
 		'serpstack',
 		'serper',
 		'serply',
 		'searchapi',
+		'serpapi',
 		'duckduckgo',
 		'tavily',
 		'jina',
@@ -35,10 +37,14 @@
 
 	const submitHandler = async () => {
 		// Convert domain filter string to array before sending
-		webConfig.search.domain_filter_list = webConfig.search.domain_filter_list
-			.split(',')
-			.map((domain) => domain.trim())
-			.filter((domain) => domain.length > 0);
+		if (webConfig.search.domain_filter_list) {
+			webConfig.search.domain_filter_list = webConfig.search.domain_filter_list
+				.split(',')
+				.map((domain) => domain.trim())
+				.filter((domain) => domain.length > 0);
+		} else {
+			webConfig.search.domain_filter_list = [];
+		}
 
 		const res = await updateRAGConfig(localStorage.token, {
 			web: webConfig,
@@ -48,6 +54,8 @@
 				proxy_url: youtubeProxyUrl
 			}
 		});
+
+		webConfig.search.domain_filter_list = webConfig.search.domain_filter_list.join(', ');
 	};
 
 	onMount(async () => {
@@ -189,6 +197,17 @@
 									bind:value={webConfig.search.mojeek_search_api_key}
 								/>
 							</div>
+						{:else if webConfig.search.engine === 'bocha'}
+							<div>
+								<div class=" self-center text-xs font-medium mb-1">
+									{$i18n.t('Bocha Search API Key')}
+								</div>
+
+								<SensitiveInput
+									placeholder={$i18n.t('Enter Bocha Search API Key')}
+									bind:value={webConfig.search.bocha_search_api_key}
+								/>
+							</div>
 						{:else if webConfig.search.engine === 'serpstack'}
 							<div>
 								<div class=" self-center text-xs font-medium mb-1">
@@ -245,6 +264,34 @@
 											type="text"
 											placeholder={$i18n.t('Enter SearchApi Engine')}
 											bind:value={webConfig.search.searchapi_engine}
+											autocomplete="off"
+										/>
+									</div>
+								</div>
+							</div>
+						{:else if webConfig.search.engine === 'serpapi'}
+							<div>
+								<div class=" self-center text-xs font-medium mb-1">
+									{$i18n.t('SerpApi API Key')}
+								</div>
+
+								<SensitiveInput
+									placeholder={$i18n.t('Enter SerpApi API Key')}
+									bind:value={webConfig.search.serpapi_api_key}
+								/>
+							</div>
+							<div class="mt-1.5">
+								<div class=" self-center text-xs font-medium mb-1">
+									{$i18n.t('SerpApi Engine')}
+								</div>
+
+								<div class="flex w-full">
+									<div class="flex-1">
+										<input
+											class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-none"
+											type="text"
+											placeholder={$i18n.t('Enter SerpApi Engine')}
+											bind:value={webConfig.search.serpapi_engine}
 											autocomplete="off"
 										/>
 									</div>

@@ -72,7 +72,7 @@ from open_webui.utils.filter import (
     get_sorted_filter_ids,
     process_filter_functions,
 )
-
+from open_webui.utils.code_interpreter import execute_code_jupyter
 
 from open_webui.tasks import create_task
 
@@ -334,21 +334,15 @@ async def chat_web_search_handler(
 
     try:
 
-        # Offload process_web_search to a separate thread
-        loop = asyncio.get_running_loop()
-        with ThreadPoolExecutor() as executor:
-            results = await loop.run_in_executor(
-                executor,
-                lambda: process_web_search(
-                    request,
-                    SearchForm(
-                        **{
-                            "query": searchQuery,
-                        }
-                    ),
-                    user,
-                ),
-            )
+        results = await process_web_search(
+            request,
+            SearchForm(
+                **{
+                    "query": searchQuery,
+                }
+            ),
+            user,
+        )
 
         if results:
             await event_emitter(
@@ -622,7 +616,13 @@ async def process_chat_payload(request, form_data, metadata, user, model):
 
     # Initialize events to store additional event to be sent to the client
     # Initialize contexts and citation
-    models = request.app.state.MODELS
+    if getattr(request.state, "direct", False) and hasattr(request.state, "model"):
+        models = {
+            request.state.model["id"]: request.state.model,
+        }
+    else:
+        models = request.app.state.MODELS
+
     task_model_id = get_task_model_id(
         form_data["model"],
         request.app.state.config.TASK_MODEL,
@@ -690,7 +690,12 @@ async def process_chat_payload(request, form_data, metadata, user, model):
 
         if "code_interpreter" in features and features["code_interpreter"]:
             form_data["messages"] = add_or_update_user_message(
-                DEFAULT_CODE_INTERPRETER_PROMPT, form_data["messages"]
+                (
+                    request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE
+                    if request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE != ""
+                    else DEFAULT_CODE_INTERPRETER_PROMPT
+                ),
+                form_data["messages"],
             )
 
     try:
@@ -767,17 +772,7 @@ async def process_chat_payload(request, form_data, metadata, user, model):
 
             if "document" in source:
                 for doc_idx, doc_context in enumerate(source["document"]):
-                    doc_metadata = source.get("metadata")
-                    doc_source_id = None
-
-                    if doc_metadata:
-                        doc_source_id = doc_metadata[doc_idx].get("source", source_id)
-
-                    if source_id:
-                        context_string += f"<source><source_id>{doc_source_id if doc_source_id is not None else source_id}</source_id><source_context>{doc_context}</source_context></source>\n"
-                    else:
-                        # If there is no source_id, then do not include the source_id tag
-                        context_string += f"<source><source_context>{doc_context}</source_context></source>\n"
+                    context_string += f"<source><source_id>{doc_idx}</source_id><source_context>{doc_context}</source_context></source>\n"
 
         context_string = context_string.strip()
         prompt = get_last_user_message(form_data["messages"])
@@ -1149,6 +1144,46 @@ async def process_chat_response(
                         content = f"{content}{block['type']}: {block_content}\n"
 
                 return content.strip()
+
+            def convert_content_blocks_to_messages(content_blocks):
+                messages = []
+
+                temp_blocks = []
+                for idx, block in enumerate(content_blocks):
+                    if block["type"] == "tool_calls":
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": serialize_content_blocks(temp_blocks),
+                                "tool_calls": block.get("content"),
+                            }
+                        )
+
+                        results = block.get("results", [])
+
+                        for result in results:
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": result["tool_call_id"],
+                                    "content": result["content"],
+                                }
+                            )
+                        temp_blocks = []
+                    else:
+                        temp_blocks.append(block)
+
+                if temp_blocks:
+                    content = serialize_content_blocks(temp_blocks)
+                    if content:
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": content,
+                            }
+                        )
+
+                return messages
 
             def tag_content_handler(content_type, tags, content, content_blocks):
                 end_flag = False
@@ -1541,7 +1576,6 @@ async def process_chat_response(
 
                     results = []
                     for tool_call in response_tool_calls:
-                        print("\n\n" + str(tool_call) + "\n\n")
                         tool_call_id = tool_call.get("id", "")
                         tool_name = tool_call.get("function", {}).get("name", "")
 
@@ -1607,23 +1641,10 @@ async def process_chat_response(
                             {
                                 "model": model_id,
                                 "stream": True,
+                                "tools": form_data["tools"],
                                 "messages": [
                                     *form_data["messages"],
-                                    {
-                                        "role": "assistant",
-                                        "content": serialize_content_blocks(
-                                            content_blocks, raw=True
-                                        ),
-                                        "tool_calls": response_tool_calls,
-                                    },
-                                    *[
-                                        {
-                                            "role": "tool",
-                                            "tool_call_id": result["tool_call_id"],
-                                            "content": result["content"],
-                                        }
-                                        for result in results
-                                    ],
+                                    *convert_content_blocks_to_messages(content_blocks),
                                 ],
                             },
                             user,
@@ -1645,26 +1666,70 @@ async def process_chat_response(
                         content_blocks[-1]["type"] == "code_interpreter"
                         and retries < MAX_RETRIES
                     ):
+                        await event_emitter(
+                            {
+                                "type": "chat:completion",
+                                "data": {
+                                    "content": serialize_content_blocks(content_blocks),
+                                },
+                            }
+                        )
+
                         retries += 1
                         log.debug(f"Attempt count: {retries}")
 
                         output = ""
                         try:
                             if content_blocks[-1]["attributes"].get("type") == "code":
-                                output = await event_caller(
-                                    {
-                                        "type": "execute:python",
-                                        "data": {
-                                            "id": str(uuid4()),
-                                            "code": content_blocks[-1]["content"],
-                                        },
+                                code = content_blocks[-1]["content"]
+
+                                if (
+                                    request.app.state.config.CODE_INTERPRETER_ENGINE
+                                    == "pyodide"
+                                ):
+                                    output = await event_caller(
+                                        {
+                                            "type": "execute:python",
+                                            "data": {
+                                                "id": str(uuid4()),
+                                                "code": code,
+                                                "session_id": metadata.get(
+                                                    "session_id", None
+                                                ),
+                                            },
+                                        }
+                                    )
+                                elif (
+                                    request.app.state.config.CODE_INTERPRETER_ENGINE
+                                    == "jupyter"
+                                ):
+                                    output = await execute_code_jupyter(
+                                        request.app.state.config.CODE_INTERPRETER_JUPYTER_URL,
+                                        code,
+                                        (
+                                            request.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_TOKEN
+                                            if request.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH
+                                            == "token"
+                                            else None
+                                        ),
+                                        (
+                                            request.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_PASSWORD
+                                            if request.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH
+                                            == "password"
+                                            else None
+                                        ),
+                                    )
+                                else:
+                                    output = {
+                                        "stdout": "Code interpreter engine not configured."
                                     }
-                                )
+
+                                log.debug(f"Code interpreter output: {output}")
 
                                 if isinstance(output, dict):
                                     stdout = output.get("stdout", "")
 
-                                    if stdout:
+                                    if isinstance(stdout, str):
                                         stdoutLines = stdout.split("\n")
                                         for idx, line in enumerate(stdoutLines):
                                             if "data:image/png;base64" in line:
@@ -1693,6 +1758,38 @@ async def process_chat_response(
                                                 )
 
                                         output["stdout"] = "\n".join(stdoutLines)
+
+                                    result = output.get("result", "")
+
+                                    if isinstance(result, str):
+                                        resultLines = result.split("\n")
+                                        for idx, line in enumerate(resultLines):
+                                            if "data:image/png;base64" in line:
+                                                id = str(uuid4())
+
+                                                # ensure the path exists
+                                                os.makedirs(
+                                                    os.path.join(CACHE_DIR, "images"),
+                                                    exist_ok=True,
+                                                )
+
+                                                image_path = os.path.join(
+                                                    CACHE_DIR,
+                                                    f"images/{id}.png",
+                                                )
+
+                                                with open(image_path, "wb") as f:
+                                                    f.write(
+                                                        base64.b64decode(
+                                                            line.split(",")[1]
+                                                        )
+                                                    )
+
+                                                resultLines[idx] = (
+                                                    f"![Output Image {idx}](/cache/images/{id}.png)"
+                                                )
+
+                                        output["result"] = "\n".join(resultLines)
                         except Exception as e:
                             output = str(e)
 
@@ -1713,6 +1810,8 @@ async def process_chat_response(
                                 },
                             }
                         )
+
+                        print(content_blocks, serialize_content_blocks(content_blocks))
 
                         try:
                             res = await generate_chat_completion(
